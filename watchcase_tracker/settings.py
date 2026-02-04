@@ -246,15 +246,14 @@ LOGGING = {
         'jig_pick_table_file': {
             'level': 'DEBUG',
             'class': 'logging.FileHandler',
-            'filename': 'JL_PickTable.log',
-            # 'filename': r'A:\Workspace\Watchcase Tracker Titan\Jig_Loading\JL_PickTable.log',
+            #'filename': 'JL_PickTable.log',
+            'filename': r'JL_PickTable.log',
             'formatter': 'detailed',
         },
         'broken_hooks_file': {
             'level': 'DEBUG',
             'class': 'logging.FileHandler',
             'filename': r'broken_hooks_detailed.log',
-            # 'filename': r'A:\Workspace\Watchcase Tracker Titan\broken_hooks_detailed.log',
             'formatter': 'broken_hooks',
         },
         'latency_file': {
