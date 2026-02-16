@@ -21,7 +21,8 @@ from math import ceil
 from django.db.models import Q
 from rest_framework.decorators import api_view, permission_classes
 from django.utils import timezone
-from DayPlanning.models import DPTrayId_History 
+from DayPlanning.models import DPTrayId_History
+from django.db.models import Sum
 from InputScreening.models import *
 
 
@@ -2085,27 +2086,35 @@ def get_accepted_tray_scan_data(request):
     lot_id = request.GET.get('lot_id')
     if not lot_id:
         return Response({'success': False, 'error': 'Missing lot_id'}, status=400)
-    
+
     try:
         stock = TotalStockModel.objects.filter(lot_id=lot_id).first()
         if not stock:
             return Response({'success': False, 'error': 'Stock not found'}, status=404)
-        
-        # ✅ NEW: Get Top Tray ID from request if provided (Phase 2 trigger)
-        top_tray_id = request.GET.get('top_tray_id')
-        
         model_no = stock.model_stock_no.model_no if stock.model_stock_no else ""
-        tray_capacity = stock.batch_id.tray_capacity if stock.batch_id and hasattr(stock.batch_id, 'tray_capacity') else 10
+        tray_capacity = (
+            stock.batch_id.tray_capacity
+            if stock.batch_id and hasattr(stock.batch_id, 'tray_capacity')
+            else 10
+        )
 
         reason_store = IP_Rejection_ReasonStore.objects.filter(lot_id=lot_id).first()
         total_rejection_qty = reason_store.total_rejection_quantity if reason_store else 0
 
         available_qty = stock.total_stock or 0
 
-        # Pass top_tray_id to both functions
-        original_distribution = get_actual_tray_distribution_for_delink(lot_id, stock, top_tray_id=top_tray_id)
-        current_distribution, _ = calculate_distribution_after_rejections(lot_id, original_distribution, top_tray_id=top_tray_id)
-        
+        original_distribution = get_actual_tray_distribution_for_delink(lot_id, stock)
+
+        # ✅ CRITICAL: Capture reused_tray_indices
+        current_distribution, _, reused_tray_indices, _ = (
+            calculate_distribution_after_rejections(
+                lot_id, original_distribution
+            )
+        )
+
+        # -------------------------------
+        # Top tray calculation
+        # -------------------------------
         top_tray_qty = 0
         top_tray_qty = 0
         for tray in current_distribution:
@@ -2113,32 +2122,47 @@ def get_accepted_tray_scan_data(request):
             if qty > 0:
                 top_tray_qty = qty
                 break
-        if top_tray_qty == 0 and available_qty > 0:
-            full_trays = available_qty // tray_capacity
-            top_tray_qty = available_qty % tray_capacity
-            if top_tray_qty == 0:
-                top_tray_qty = tray_capacity
 
-        has_draft = IP_Accepted_TrayID_Store.objects.filter(lot_id=lot_id, is_draft=True).exists()
-        delink_trays = []         # <-- Initialize here
-        draft_record = None       # <-- Initialize here
+        if top_tray_qty == 0 and available_qty > 0:
+            remainder = available_qty % tray_capacity
+            top_tray_qty = remainder if remainder > 0 else tray_capacity
+
+        # -------------------------------
+        # Delink logic (CAUSE-BASED)
+        # -------------------------------
+        zero_trays = current_distribution.count(0)
+        reused_existing_trays = len(reused_tray_indices)
+
+        required_delinks = min(zero_trays, reused_existing_trays)
+
+        # -------------------------------
+        # Draft handling
+        # -------------------------------
+        has_draft = IP_Accepted_TrayID_Store.objects.filter(
+            lot_id=lot_id,
+            is_draft=True
+        ).exists()
+
+        delink_trays = []
+        draft_record = None
 
         if has_draft:
             draft_record = IP_Accepted_TrayID_Store.objects.filter(
-                lot_id=lot_id, 
+                lot_id=lot_id,
                 is_draft=True
             ).first()
-            # ✅ In your backend function, add this debug:
-            if draft_record:
-                print(f"🔍 Draft delink_trays: {draft_record.delink_trays}")
-                print(f"🔍 Draft delink_trays type: {type(draft_record.delink_trays)}")
-                
-            delink_trays = draft_record.delink_trays or [] if draft_record else []
-            print(f"🔍 Final delink_trays for response: {delink_trays}")
 
+            stored_delinks = draft_record.delink_trays or []
+
+            # 🔒 Clamp delinks to physically justified count
+            delink_trays = stored_delinks[:required_delinks]
+
+        # -------------------------------
+        # Verification flags
+        # -------------------------------
         top_tray_verified = stock.ip_top_tray_qty_verified or False
         verified_tray_qty = stock.ip_verified_tray_qty or 0
-        
+
         return Response({
             'success': True,
             'model_no': model_no,
@@ -2148,15 +2172,18 @@ def get_accepted_tray_scan_data(request):
             'top_tray_qty': top_tray_qty,
             'has_draft': has_draft,
             'delink_trays': delink_trays,
-            "draft_tray_id": draft_record.top_tray_id if draft_record else "",  # Avoid error if no draft
+            'draft_tray_id': draft_record.top_tray_id if draft_record else "",
             'top_tray_verified': top_tray_verified,
             'verified_tray_qty': verified_tray_qty,
             'debug_info': {
                 'original_distribution': original_distribution,
                 'current_distribution': current_distribution,
-                'calculation_method': 'first_non_empty_tray'
+                'zero_trays': zero_trays,
+                'reused_existing_trays': reused_existing_trays,
+                'required_delinks': required_delinks
             }
         })
+
     except Exception as e:
         import traceback
         traceback.print_exc()
@@ -2698,22 +2725,21 @@ class IS_Completed_Table(APIView):
             data['model_images'] = images
             
             # Simplified accepted quantity logic
-            total_ip_accepted_quantity = data.get('total_ip_accepted_quantity')
-            lot_id = data.get('stock_lot_id')
 
-            if total_ip_accepted_quantity and total_ip_accepted_quantity > 0:
-                # Use stored accepted quantity if available
-                data['display_accepted_qty'] = total_ip_accepted_quantity
-            else:
-                # Calculate from total_stock - total_rejection_qty
-                total_rejection_qty = data.get('ip_rejection_total_qty', 0)
-                total_stock = data.get('total_stock', 0)
-                
-                if total_stock > 0 and total_rejection_qty > 0:
-                    data['display_accepted_qty'] = max(total_stock - total_rejection_qty, 0)
-                    print(f"Calculated accepted qty for {lot_id}: {total_stock} - {total_rejection_qty} = {data['display_accepted_qty']}")
-                else:
-                    data['display_accepted_qty'] = 0
+            actual_trays = IPTrayId.objects.filter(
+                lot_id=data['stock_lot_id'],
+                delink_tray=False,
+                rejected_tray=False,
+                tray_quantity__gt=0
+            )
+
+            # ✅ FIX: Accepted quantity from actual trays (same source as no_of_trays)
+            accepted_qty_from_trays = actual_trays.aggregate(
+                total=Sum('tray_quantity')
+            )['total'] or 0
+
+            data['display_accepted_qty'] = accepted_qty_from_trays
+
 
             master_data.append(data)
 
@@ -2831,13 +2857,20 @@ class IS_AcceptTable(APIView):
                 'brass_qc_accepted_qty_verified': total_stock_obj.brass_qc_accepted_qty_verified,
             }
 
+            total_stock = total_stock_obj.total_stock or 0
             # Calculate no_of_trays
-            total_stock = data.get('total_stock', 0)
-            tray_capacity = data.get('tray_capacity', 0)
-            if tray_capacity > 0:
-                data['no_of_trays'] = math.ceil(total_stock / tray_capacity)
-            else:
-                data['no_of_trays'] = 0
+            # FIX: derive tray count from actual trays, not math
+            lot_id = data['stock_lot_id']
+
+            actual_trays = IPTrayId.objects.filter(
+                lot_id=data['stock_lot_id'],
+                delink_tray=False,
+                rejected_tray=False,
+                tray_quantity__gt=0
+            )
+
+            data['no_of_trays'] = actual_trays.count()
+
             
             # Vendor location combination
             data['vendor_location'] = f"{total_stock_obj.batch_vendor_internal or ''}_{total_stock_obj.batch_location_name or ''}"
@@ -3064,7 +3097,10 @@ class IS_RejectTable(APIView):
             
             # ✅ FIX: Calculate no_of_trays from IPTrayId + Delinked History
             # Active trays (Accepted/Rejected) are in IPTrayId
-            active_tray_count = IPTrayId.objects.filter(lot_id=stock_lot_id).count()
+            active_tray_count = IPTrayId.objects.filter(
+                lot_id=stock_lot_id,
+                delink_tray=False
+            ).count()
             
             # Total trays = Active Trays + Delinked Trays
             total_physical_trays = active_tray_count + delinked_qty
@@ -3391,235 +3427,253 @@ def get_rejection_draft(request):
 @permission_classes([IsAuthenticated])
 def get_delink_tray_data(request):
     """
-    Get delink tray data based on empty trays after all rejections are applied.
-    
-    CORRECTED LOGIC:
-    - Only create delink rows for trays that have 0 quantity pre-normalization
-    - EXCLUDE trays used in rejection (must preserve history)
-    - EXCLUDE top tray (never delink top tray automatically)
+    Delink logic:
+    - Z = number of empty trays
+    - R = number of reused trays
+    - Delink only (Z - R) trays
+    - Reused trays cancel emptiness first
     """
+
     try:
         lot_id = request.GET.get('lot_id')
         top_tray_id = request.GET.get('top_tray_id') # ✅ Phase 2 trigger
         
         if not lot_id:
             return Response({'success': False, 'error': 'No lot_id provided'}, status=400)
-        
+
         stock = TotalStockModel.objects.filter(lot_id=lot_id).first()
         if not stock:
-            return Response({'success': False, 'error': 'No stock record found for this lot'}, status=404)
-        
-        # 1. Get structured distributions (Pass top_tray_id)
-        original_distribution = get_actual_tray_distribution_for_delink(lot_id, stock, top_tray_id=top_tray_id)
-        current_distribution, raw_distribution = calculate_distribution_after_rejections(lot_id, original_distribution, top_tray_id=top_tray_id)
-        
-        # 2. Get trays used in rejection
-        rejected_tray_ids = set(
-            IP_Rejected_TrayScan.objects.filter(lot_id=lot_id)
-            .values_list('rejected_tray_id', flat=True)
+            return Response({'success': False, 'error': 'No stock record found'}, status=404)
+
+        original_distribution = get_actual_tray_distribution_for_delink(lot_id, stock)
+
+        (
+            current_distribution,
+            raw_distribution,
+            reused_tray_indices,
+            floating_extra_qty
+        ) = calculate_distribution_after_rejections(
+            lot_id, original_distribution
         )
-        
+
+        # ---------------------------------------
+        # Compute counts
+        # ---------------------------------------
+        zero_indices = [i for i, qty in enumerate(raw_distribution) if qty == 0]
+        Z = len(zero_indices)
+        R = len(reused_tray_indices)
+
+        # Delink empty trays that are not reused
+        delink_count = max(0, Z - R)
+
+        # ---------------------------------------
+        # Choose trays to delink
+        # Prefer trays NOT involved in reuse
+        # ---------------------------------------
+        candidate_indices = [
+            i for i in zero_indices
+            if i not in reused_tray_indices
+        ]
+
+        delink_indices = candidate_indices[:delink_count]
+
+        # ✅ FIX: Only delink when there is floating extra quantity to absorb
+        if floating_extra_qty == 0:
+            delink_indices = []
+
+        # ---------------------------------------
+        # Build response
+        # ---------------------------------------
         delink_data = []
-        empty_tray_indices = []
-        
-        # 3. Identify eligible delink trays
-        for i, tray in enumerate(raw_distribution):
-            qty = tray.get('qty', 0)
-            tray_id = tray.get('tray_id')
-            is_top = tray.get('is_top_tray') or tray_id == 'TOP'
-            
-            if qty == 0:
-                # FILTER: Used in rejection?
-                if tray_id and tray_id in rejected_tray_ids:
-                    print(f"[DELINK] Skipping tray {tray_id} (index {i}) - used in rejection")
-                    continue
-                
-                # FILTER: Is Top Tray?
-                if is_top:
-                    print(f"[DELINK] Skipping TOP tray (index {i})")
-                    continue
-                
-                # Eligible
-                empty_tray_indices.append(i)
-                
-                # Get original quantity for display
-                orig_qty = original_distribution[i].get('qty', 0) if i < len(original_distribution) else 0
-                
-                delink_data.append({
-                    'sno': len(delink_data) + 1,
-                    'tray_id': tray_id or '',
-                    'tray_quantity': 0, # ✅ UPDATED: Always 0 for delinked trays
-                    'tray_index': i,
-                    'source': 'empty_tray_after_rejection'
-                })
+        for idx, tray_index in enumerate(delink_indices):
+            original_qty = (
+                original_distribution[tray_index]
+                if tray_index < len(original_distribution)
+                else 0
+            )
 
-        # Prepare frontend-compatible simple lists (ints)
-        current_distribution_ints = [t.get('qty', 0) for t in current_distribution]
+            delink_data.append({
+                'sno': idx + 1,
+                'tray_id': '',
+                'tray_quantity': 0,
+                'tray_index': tray_index,
+                'source': 'unexplained_empty_after_normalization',
+                'previous_tray_quantity': original_qty
+            })
 
-        print(f"[DELINK] original={original_distribution}, "
-              f"raw={raw_distribution}, "
-              f"current_ints={current_distribution_ints}, "
-              f"delink_count={len(delink_data)}")
+
+        print(
+            f"[DELINK] raw={raw_distribution}, "
+            f"zero_indices={zero_indices}, "
+            f"reused_indices={reused_tray_indices}, "
+            f"delink_indices={delink_indices}"
+        )
 
         return Response({
             'success': True,
             'delink_trays': delink_data,
             'total_count': len(delink_data),
             'lot_id': lot_id,
-            'original_distribution': [t.get('qty', 0) for t in original_distribution], # Ints for display/debug
-            'current_distribution': current_distribution_ints, # return Ints for frontend compatibility
-            'empty_trays_count': len(delink_data),
             'debug_info': {
-                'reasoning': 'Qty=0 AND Not Rejected AND Not Top',
+                'raw_distribution': raw_distribution,
+                'zero_count': Z,
+                'reused_count': R,
+                'delink_count': delink_count,
+                'reused_tray_indices': list(reused_tray_indices),
+                'delink_indices': delink_indices
             }
         })
+
     except Exception as e:
         import traceback
         traceback.print_exc()
         return Response({'success': False, 'error': str(e)}, status=500)
 
 
-def calculate_distribution_after_rejections(lot_id, original_distribution, top_tray_id=None):
-    """
-    Calculate distribution handling STRUCTURED data (dicts with tray_id).
-    Accepts: List of dicts [{'tray_id': '...', 'qty': 12}, ...], top_tray_id (Optional)
-    Returns: (normalized_struct, raw_struct)
-    
-    UPDATED: Separated into Phases.
-    Phase 1 (Validation Only): top_tray_id is None. Apply subtraction only, no floating redistribution.
-    Phase 2 (Redistribution): top_tray_id is provided. Full logic.
-    """
-    # Defensive: ensure we are working with dicts.
-    current_distribution = []
-    if original_distribution and isinstance(original_distribution[0], int):
-         # caller didn't zip? fallback
-         current_distribution = [{'tray_id': None, 'qty': q} for q in original_distribution]
-    else:
-         # Deep copy to avoid mutating original
-         import copy
-         current_distribution = copy.deepcopy(original_distribution)
 
+def calculate_distribution_after_rejections(lot_id, original_distribution):
+    """
+    Calculate tray distribution after rejections.
+
+    Guarantees:
+    - reused_tray_indices contains ONLY indices of EXISTING trays reused
+    - indices always refer to original_distribution positions
+    """
+
+    current_distribution = original_distribution.copy()
     floating_extra_qty = 0
-    rejections = IP_Rejected_TrayScan.objects.filter(lot_id=lot_id).order_by('id')
 
-    print(f"DEBUG: Processing {rejections.count()} rejections for lot {lot_id} (Phase={'2' if top_tray_id else '1'})")
+    # ✅ CLEAN invariant: indices ONLY from original_distribution
+    reused_tray_indices = set()
+
+    tray_count = len(original_distribution)
+
+    rejections = IP_Rejected_TrayScan.objects.filter(
+        lot_id=lot_id
+    ).order_by('id')
+
+    print(f"DEBUG: Starting distribution: {original_distribution}")
 
     for rejection in rejections:
-        rejected_qty = int(rejection.rejected_tray_quantity) if rejection.rejected_tray_quantity else 0
-        tray_id = rejection.rejected_tray_id
-        
-        if rejected_qty <= 0: continue
+        rejected_qty = int(rejection.rejected_tray_quantity or 0)
+        tray_id = (rejection.rejected_tray_id or "").strip()
 
-        # Scenario A: SHORTAGE (No tray ID)
-        if not tray_id or tray_id.strip() == '':
-             if top_tray_id and floating_extra_qty > 0:
-                 consumed = min(floating_extra_qty, rejected_qty)
-                 floating_extra_qty -= consumed
-                 rejected_qty -= consumed
-             
-             if rejected_qty > 0:
-                 # Consume from smallest trays first
-                 sorted_indices = sorted(range(len(current_distribution)), key=lambda i: current_distribution[i]['qty'])
-                 for i in sorted_indices:
-                     if rejected_qty <= 0: break
-                     curr = current_distribution[i]['qty']
-                     if curr >= rejected_qty:
-                         current_distribution[i]['qty'] = curr - rejected_qty
-                         rejected_qty = 0
-                     elif curr > 0:
-                         rejected_qty -= curr
-                         current_distribution[i]['qty'] = 0
-             continue
+        if rejected_qty <= 0:
+            continue
 
-        # Scenario B: Tray Rejection (Existing or New)
+        # -------------------------------
+        # Scenario A: SHORTAGE (no tray)
+        # -------------------------------
+        if not tray_id:
+            if floating_extra_qty > 0:
+                consumed = min(floating_extra_qty, rejected_qty)
+                floating_extra_qty -= consumed
+                rejected_qty -= consumed
+
+            if rejected_qty > 0:
+                current_distribution = consume_shortage_from_distribution(
+                    current_distribution, rejected_qty
+                )
+            continue
+
+        # -------------------------------
+        # Scenario B: Tray-based rejection
+        # -------------------------------
         is_new = is_new_tray_by_id(tray_id)
+
         if is_new:
-             if top_tray_id and floating_extra_qty > 0:
-                 consumed = min(floating_extra_qty, rejected_qty)
-                 floating_extra_qty -= consumed
-                 rejected_qty -= consumed
-             
-             if rejected_qty > 0:
-                 sorted_indices = sorted(range(len(current_distribution)), key=lambda i: current_distribution[i]['qty'])
-                 for i in sorted_indices:
-                     if rejected_qty <= 0: break
-                     curr = current_distribution[i]['qty']
-                     if curr >= rejected_qty:
-                         current_distribution[i]['qty'] = curr - rejected_qty
-                         rejected_qty = 0
-                     elif curr > 0:
-                         rejected_qty -= curr
-                         current_distribution[i]['qty'] = 0
+            # ✅ New trays NEVER cause delink
+            if floating_extra_qty > 0:
+                consumed = min(floating_extra_qty, rejected_qty)
+                floating_extra_qty -= consumed
+                rejected_qty -= consumed
 
+            if rejected_qty > 0:
+                current_distribution = free_up_space_optimally(
+                    current_distribution, rejected_qty
+                )
         else:
-             # EXISTING TRAY: Find precise tray by ID
-             target_tray = next((t for t in current_distribution if t['tray_id'] == tray_id), None)
-             
-             if target_tray:
-                 print(f"DEBUG: Found tray {tray_id} with qty {target_tray['qty']}. Zeroing out.")
-                 freed = target_tray['qty'] - rejected_qty
-                 target_tray['qty'] = 0 # Zero it
-                 floating_extra_qty += freed
-             else:
-                 print(f"DEBUG: Tray {tray_id} not found in distribution! Likely delinked or anomaly.")
-                 pass
+            # ❌ EXISTING tray reused → THIS causes delink
+            (
+                current_distribution,
+                freed_good_items,
+                zeroed_index
+            ) = remove_rejected_tray_from_distribution(
+                current_distribution,
+                rejected_qty
+            )
 
-    # Save RAW (zeros preserved)
-    import copy
-    raw_distribution = copy.deepcopy(current_distribution)
-
-    # ✅ PHASE 2 ONLY: Normalize (Add floating to top or create new)
-    if top_tray_id:
-        if floating_extra_qty > 0:
-            if len(current_distribution) > 0:
-                # Find the explicit top tray by user-provided ID first
-                top_tray = next((t for t in current_distribution if t.get('tray_id') == top_tray_id), None)
-                
-                # Fallback to existing top flag if ID not found in current distribution
-                if not top_tray:
-                    top_tray = next((t for t in current_distribution if t.get('is_top_tray') or t.get('tray_id') == 'TOP'), None)
-                
-                if top_tray:
-                    top_tray['qty'] += floating_extra_qty
-                    print(f"DEBUG (Phase 2): Added floating {floating_extra_qty} to TOP tray {top_tray.get('tray_id')}")
-                else:
-                    current_distribution[0]['qty'] += floating_extra_qty
-                    print(f"DEBUG (Phase 2): Added floating {floating_extra_qty} to first tray (fallback)")
+            # ✅ HARD GUARD: index must belong to original_distribution
+            if zeroed_index is not None and 0 <= zeroed_index < tray_count:
+                reused_tray_indices.add(zeroed_index)
             else:
-                current_distribution.append({'tray_id': top_tray_id, 'qty': floating_extra_qty, 'is_top_tray': True})
+                print(
+                    f"⚠️ Ignored invalid reused index: {zeroed_index}"
+                )
 
-        # Filter out empty trays for the normalized Phase 2 view
-        current_distribution = [t for t in current_distribution if t['qty'] > 0]
-    
-    else:
-        # Phase 1: Keep zeros, keep floating_extra_qty out of the distribution (it's lost until Phase 2)
-        print(f"ℹ️ PHASE 1: Preserving zeros and {floating_extra_qty} floating items (Display only)")
-        # We return current_distribution as-is (with zeros). 
-        # The user's feedback says "Do NOT redistribute".
-        pass
+            floating_extra_qty += freed_good_items
 
-    return current_distribution, raw_distribution
+        print(f"DEBUG: Distribution step: {current_distribution}")
+
+    # -------------------------------
+    # Final floating merge (NO reuse)
+    # -------------------------------
+    if floating_extra_qty > 0:
+        if current_distribution:
+            current_distribution[0] += floating_extra_qty
+        else:
+            current_distribution.append(floating_extra_qty)
+
+    raw_distribution = current_distribution.copy()
+
+    # -------------------------------
+    # Normalization (structure-safe)
+    # -------------------------------
+    total_remaining = sum(current_distribution)
+
+    tray_capacity = 12
+    ts = TotalStockModel.objects.filter(lot_id=lot_id).first()
+    if ts and ts.batch_id and ts.batch_id.tray_capacity:
+        tray_capacity = ts.batch_id.tray_capacity
+
+    normalized = normalize_distribution(
+        total_remaining,
+        tray_capacity,
+        tray_count
+    )
+
+    print(f"DEBUG: Final normalized distribution: {normalized}")
+    print(f"DEBUG: CLEAN reused_tray_indices: {reused_tray_indices}")
+
+    return normalized, raw_distribution, reused_tray_indices, floating_extra_qty
 
 
-def normalize_distribution(total_qty, tray_capacity):
+def normalize_distribution(total_qty, tray_capacity, tray_count):
     """
-    Build a distribution from total quantity that satisfies the invariant:
-      - distribution[0] = partial top tray (1..tray_capacity)
-      - distribution[i] = tray_capacity for all i > 0
-      - No zero-quantity entries
+    Normalize quantity while PRESERVING tray count.
+
+    Rules:
+    - Sum(distribution) == total_qty
+    - Each tray <= tray_capacity
+    - distribution length == tray_count
+    - Zero-quantity trays are preserved
     """
-    if total_qty <= 0:
+
+    if tray_count <= 0:
         return []
 
-    full_trays = total_qty // tray_capacity
-    remainder = total_qty % tray_capacity
+    distribution = [0] * tray_count
 
-    if remainder > 0:
-        # Partial top tray + full trays
-        return [remainder] + [tray_capacity] * full_trays
-    else:
-        # All trays are full
-        return [tray_capacity] * full_trays
+    remaining = total_qty
+
+    for i in range(tray_count):
+        if remaining <= 0:
+            break
+        fill = min(tray_capacity, remaining)
+        distribution[i] = fill
+        remaining -= fill
+
+    return distribution
 
 
 def consume_shortage_from_distribution(distribution, shortage_qty):
@@ -3651,7 +3705,7 @@ def consume_shortage_from_distribution(distribution, shortage_qty):
 def remove_rejected_tray_from_distribution(distribution, rejected_qty):
     """
     EXISTING tray rejection.
-    Returns: (updated_distribution, freed_good_items)
+    Returns: (updated_distribution, freed_good_items, zeroed_index)
     
     CRITICAL: Sets tray quantity to 0 instead of removing it.
     This preserves physical tray identity so delink can detect zeros.
@@ -3665,17 +3719,18 @@ def remove_rejected_tray_from_distribution(distribution, rejected_qty):
     total_available = sum(result)
     
     if total_available < rejected_qty:
-        return result, 0  # Should not happen ideally
+        return result, 0, None  # Should not happen ideally
     
     # Step 1: Try to find exact match, prefer non-top-tray (index > 0)
     for i in range(1, len(result)):
         if result[i] == rejected_qty:
             result[i] = 0  # Zero out, do NOT pop
-            return result, 0  # No freed good items
+            return result, 0, i  # No freed good items, index i used
     # Fallback: check top tray
     if len(result) > 0 and result[0] == rejected_qty:
-        result[0] = 0
-        return result, 0
+        if len(result) > 0 and result[0] == rejected_qty:
+            result[0] = 0
+        return result, 0, 0
     
     # Step 2: No exact match. Find best tray (minimum waste).
     best_idx = -1
@@ -3698,8 +3753,9 @@ def remove_rejected_tray_from_distribution(distribution, rejected_qty):
         original_qty = result[best_idx]
         freed_good_items = original_qty - rejected_qty
         result[best_idx] = 0  # Zero out, do NOT pop
+        result[best_idx] = 0  # Zero out, do NOT pop
         print(f"DEBUG: Zeroed tray at index {best_idx} (was {original_qty}), freed {freed_good_items} good items")
-        return result, freed_good_items
+        return result, freed_good_items, best_idx
 
     # Fallback: zero out the largest non-top tray
     if len(result) > 1:
@@ -3711,7 +3767,7 @@ def remove_rejected_tray_from_distribution(distribution, rejected_qty):
     original_qty = result[max_idx]
     freed_good_items = max(0, original_qty - rejected_qty)
     result[max_idx] = 0  # Zero out, do NOT pop
-    return result, freed_good_items
+    return result, freed_good_items, max_idx
 
 
 def free_up_space_optimally(distribution, qty_to_free):
@@ -3719,7 +3775,7 @@ def free_up_space_optimally(distribution, qty_to_free):
     Free up space in existing trays when NEW tray is used for rejection.
     Moves pieces from existing trays to the new tray.
     
-    ✅ FIX: Free space from BOTTOM trays first (reverse order) to preserve
+    FIX: Free space from BOTTOM trays first (reverse order) to preserve
     the top tray's quantity. This ensures the top tray (index 0) is the
     last one affected.
     """
@@ -4077,14 +4133,13 @@ class TrayIdList_Complete_APIView(APIView):
         if not lot_id:
             return JsonResponse({'success': False, 'error': 'Missing lot_id or stock_lot_id'}, status=400)
         
-        # 1. Get Calculated Accepted Trays (Correct Handling of Rejections & Floating Qty)
-        # For completed lots, we identify the top tray from DB to trigger Phase 2 (Redistribution)
-        stock_obj = TotalStockModel.objects.filter(lot_id=lot_id).first()
-        top_tray_id = None
-        if stock_obj:
-            top_tray_rec = IPTrayId.objects.filter(lot_id=lot_id, top_tray=True).first()
-            if top_tray_rec:
-                top_tray_id = top_tray_rec.tray_id
+        # 1. Active Trays (Accepted/Rejected) from IPTrayId
+        # Quantity > 0 ensures we only get valid active trays
+        active_trays = IPTrayId.objects.filter(
+            lot_id=lot_id,
+            delink_tray=False,
+            tray_quantity__gt=0
+        )
 
         original = get_actual_tray_distribution_for_delink(lot_id, stock_obj, top_tray_id=top_tray_id)
         accepted_trays_dicts, _ = calculate_distribution_after_rejections(lot_id, original, top_tray_id=top_tray_id)
@@ -4156,7 +4211,7 @@ class TrayIdList_Complete_APIView(APIView):
             # ✅ BUSINESS RULE: Delinked trays must show 0 quantity as they are empty
             delinked_trays_list.append({
                 'tray_id': hist['tray_id'],
-                'tray_quantity': 0, 
+                'tray_quantity': 0, # Handle potential None
                 'rejected_tray': hist['rejected_tray'],
                 'delink_tray': True,
                 'top_tray': hist['top_tray'],
@@ -4170,27 +4225,28 @@ class TrayIdList_Complete_APIView(APIView):
         # Prepare the final list of trays to process
         trays_to_process = []
 
-        # Apply filtering
-        if accepted_ip_stock and not few_cases_accepted_ip_stock:
-            # Show accepted trays only
-            trays_to_process = accepted_trays
-            print("Filtering for accepted trays only")
+        if accepted_ip_stock:
+            # ACCEPT TABLE: accepted trays ONLY
+            trays_to_process = list(accepted_trays)
+            print("Accept Table => accepted trays only")
 
-        elif rejected_ip_stock and not few_cases_accepted_ip_stock:
-            # Show rejected trays only
-            trays_to_process = rejected_trays_list
-            print("Filtering for rejected trays only")
+        elif rejected_ip_stock:
+            # Reject table → rejected + delinked
+            trays_to_process = list(rejected_trays) + delinked_trays_list
+            print("Reject Table => rejected + delinked trays")
 
         elif few_cases_accepted_ip_stock:
-            # Show all types
-            # Use `rejected_trays_list`
-            trays_to_process = accepted_trays + rejected_trays_list + delinked_trays_list
-            print("Showing accepted, rejected, and delinked trays (Partial/Few Cases)")
+            # Complete table → full picture
+            trays_to_process = (
+                list(accepted_trays)
+                + list(rejected_trays)
+                + delinked_trays_list
+            )
+            print("Complete Table => accepted + rejected + delinked")
 
         else:
-            # Default
-            trays_to_process = accepted_trays + rejected_trays_list + delinked_trays_list
-            print("Using default filter - showing all")
+            trays_to_process = list(active_trays)
+
             
         final_data_list = []
         top_tray_data = None
@@ -4212,10 +4268,9 @@ class TrayIdList_Complete_APIView(APIView):
         for tray in trays_to_process:
             attrs = get_tray_attrs(tray)
             
-            # Check for top tray (either by flag or ID)
-            is_top = attrs.get('top_tray') or attrs.get('tray_id') == 'TOP'
-            
-            if is_top and not top_tray_data:
+            # Criteria for top tray: marked as top_tray AND usually active
+            # If multiple top trays exist (weird), pick first.
+            if ifattrs_top and not attrs.get('delink_tray') and not top_tray_data:
                 top_tray_data = attrs
             else:
                 processed_trays.append(attrs)
@@ -4727,20 +4782,18 @@ def reject_check_tray_id_simple(request):
         top_tray_qty = top_tray.tray_quantity if top_tray else 0
         top_tray_id = top_tray.tray_id if top_tray else None
 
-        # Coverage calculation — Rule 1 & 2
-        remaining_after_top = max(0, total_rejected_qty - top_tray_qty)
+        # ✅ FIX: Calculate reuse based on how many existing trays become qty=0 after rejection
+        non_rejected_trays = IPTrayId.objects.filter(lot_id=current_lot_id, rejected_tray=False)
+        total_tray_count = non_rejected_trays.count()
+        total_qty = sum(t.tray_quantity or 0 for t in non_rejected_trays)
 
-        if remaining_after_top == 0:
-            # Rule 1: Rejection fits entirely within the top tray → no reuse needed
-            allowed_reusable_trays = 0
-        else:
-            # Rule 2: Overflow requires additional trays
-            allowed_reusable_trays = math.ceil(remaining_after_top / tray_capacity)
-
-
+        remaining_qty = max(0, total_qty - total_rejected_qty)
+        trays_needed = math.ceil(remaining_qty / tray_capacity) if remaining_qty > 0 else 0
+        allowed_reusable_trays = max(0, total_tray_count - trays_needed)
 
         print(f"[INPUT_REUSE] total_rejected={total_rejected_qty}, top_tray={top_tray_id}, "
-              f"top_tray_qty={top_tray_qty}, remaining_after_top={remaining_after_top}, "
+              f"total_qty={total_qty}, total_tray_count={total_tray_count}, "
+              f"remaining_qty={remaining_qty}, trays_needed={trays_needed}, "
               f"capacity={tray_capacity}, allowed_reusable_trays={allowed_reusable_trays}")
 
         # ---------------------------------------------------------
@@ -4757,6 +4810,8 @@ def reject_check_tray_id_simple(request):
             for t_id in alloc_tray_ids:
                 if not t_id:
                     continue
+                if t_id == tray_id:
+                    continue  # Don't count the current tray being scanned as used
                 # Top tray is NOT a reusable tray — it already exists
                 if top_tray and t_id == top_tray.tray_id:
                     continue
